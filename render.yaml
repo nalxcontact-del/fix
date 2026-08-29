@@ -1,0 +1,79 @@
+services:
+  - type: web
+    name: personachat
+    runtime: node
+    plan: free
+    buildCommand: npm install --no-audit --no-fund && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 24.20.0
+      - key: NODE_ENV
+        value: production
+
+      # Production Postgres / Supabase
+      - key: DATABASE_POOLER_URL
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        sync: false
+      - key: SUPABASE_STORAGE_PUBLIC_BASE_URL
+        sync: false
+
+      # PersonaChat production cutover
+      - key: PERSONACHAT_PRODUCTION_POSTGRES
+        value: "1"
+      - key: PERSONACHAT_POSTGRES_ACCOUNTS
+        value: "1"
+      - key: PERSONACHAT_POSTGRES_CHAT
+        value: "1"
+      - key: PERSONACHAT_POSTGRES_SOCIAL
+        value: "1"
+      - key: PERSONACHAT_POSTGRES_CONTROL
+        value: "1"
+      - key: PERSONACHAT_REQUIRE_POSTGRES
+        value: "1"
+
+      # AI / OSINT
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+
+      # Stripe
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_MONTHLY_PRICE_ID
+        sync: false
+      - key: STRIPE_YEARLY_PRICE_ID
+        sync: false
+
+      # Google OAuth
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+
+      # Admin / public URL
+      - key: PERSONACHAT_ADMIN_EMAILS
+        sync: false
+      - key: PERSONACHAT_ADMIN_USER_IDS
+        sync: false
+      - key: PERSONACHAT_PUBLIC_URL
+        sync: false
+
+      # Optional distributed rate limiting
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false

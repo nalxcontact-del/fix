@@ -1,0 +1,421 @@
+    const onFocus = () => { void sync(); schedule(); };
+    const onVisibility = () => { if (document.visibilityState === "visible") { void sync(); schedule(); } };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    schedule();
+    return () => { cancelled = true; if (timer !== null) window.clearTimeout(timer); window.removeEventListener("focus", onFocus); document.removeEventListener("visibilitychange", onVisibility); };
+  }, [authReady, user?.id, hasAuthenticatedUser, activeConversation]);
+
+  useEffect(() => {
+    if (!authReady || !hasAuthenticatedUser) return;
+    const characterId = new URLSearchParams(window.location.search).get("character");
+    if (!characterId || selected?.id === characterId) return;
+    const target = allCharacters.find(c => c.id === characterId);
+    if (target) {
+      window.history.replaceState({}, "", window.location.pathname);
+      openCharacter(target);
+    }
+  // openCharacter is a function declaration recreated on render; adding it here would make the deep-link effect rerun on every render.
+  // The effect is guarded by the URL character id and only runs when auth/character data changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authReady, hasAuthenticatedUser, allCharacters, selected?.id]);
+
+  async function submitHomeSearch(mode: "characters" | "creators" = searchMode, value = search) {
+    const query = value.trim();
+    if (!query) return;
+    setSearch(query); setSearchMode(mode); setHomeSearchSubmitted(true);
+    if (mode === "creators") {
+      try {
+        const res = await fetch(`/api/community?mode=creators&q=${encodeURIComponent(query)}`, { credentials:"include", cache:"no-store" });
+        const data = await res.json();
+        setCreatorSearchResults(Array.isArray(data.creators) ? data.creators : []);
+      } catch { setCreatorSearchResults([]); }
+    } else {
+      setCreatorSearchResults([]);
+    }
+  }
+  function clearHomeSearch() { setSearch(""); setHomeSearchSubmitted(false); setCreatorSearchResults([]); }
+
+  async function submitAuth() {
+    if (authLoading) return;
+    setAuthError("");
+    setAuthLoading(true);
+    try {
+      const result = authMode === "login" ? await login(authEmail, authPassword) : await register(authName, authEmail, authPassword);
+      if (result.error) { setAuthError(result.error); return; }
+      if (result.user) {
+        setUser(result.user);
+        try { const data = await loadAppData(); setConversations(data.conversations); setMemories(data.memories); setRelationships(data.relationships); const p = await profileRequest(); setProfileData(p.profile); setLikedBotIds(p.profile.likedBotIds); setCommunityBots(p.profile.bots); setProfileName(p.profile.name); setProfileUsername(p.profile.username); setProfileAvatar(p.profile.avatar); await loadExplore(); } catch (e) { console.error(e); }
+      }
+      setAuthPassword("");
+    } catch {
+      setAuthError("Unable to complete this right now. Please try again.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function signOut() { void fetch("/api/capacity", { method: "DELETE", credentials: "include", keepalive: true }).catch(() => {}); logout(); setCapacity(null); setUser(null); setProfileOpen(false); setProfileView(false); setSelected(null); setActiveConversation(null); }
+
+  async function openProfile(id?: string) { setProfileOpen(false); const p = await loadProfile(id); if (p) { setProfileView(true); setProfileTab("created"); setMobileTab("profile"); } }
+
+  async function updateProfile() {
+    try {
+      const res = await profileRequest("/api/profile", { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify({name:profileName,username:profileUsername,avatar:profileAvatar,gender:profileGender || null}) });
+      setProfileData(res.profile); setProfileAvatar(res.profile.avatar); setProfileGender(res.profile.gender ?? ""); setProfileEdit(false); setProfileMessage("Profile updated.");
+      if (user) setUser({...user, name:res.profile.name, username:res.profile.username, avatar:res.profile.avatar, gender:res.profile.gender ?? null});
+    } catch (e:any) { setProfileMessage(e.message); }
+  }
+
+  function chooseAvatar(file: File | undefined) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setProfileMessage("Choose an image."); return; }
+    if (file.size > 1_500_000) { setProfileMessage("Use an image up to 1.5 MB."); return; }
+    const reader = new FileReader(); reader.onload = () => setProfileAvatar(String(reader.result)); reader.readAsDataURL(file);
+  }
+
+  async function communityAction(action:string, targetId:string) {
+    try {
+      const res = await profileRequest("/api/profile", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({action,targetId}) });
+      if (action === "like-bot") { setLikedBotIds(ids => res.liked ? [...new Set([...ids,targetId])] : ids.filter(id=>id!==targetId)); await loadExplore(exploreSearch); }
+      if (action === "follow") await loadProfile(profileData?.id);
+      if (action === "follow" && profileData) setProfileData({...profileData, followers: profileData.followers + (res.following ? 1 : -1), viewerFollowing:res.following});
+    } catch(e:any) { setProfileMessage(e.message); }
+  }
+
+  async function saveBot() {
+    if (publishingBot) return;
+    setPublishingBot(true);
+    setProfileMessage("");
+    try {
+      const tags = botForm.tags.split(",").map(s=>s.trim()).filter(Boolean);
+      const action = editingBotId ? "update-bot" : "create-bot";
+      const previousBot = editingBotId ? communityBots.find(x => x.id === editingBotId) : undefined;
+      const previousGreeting = previousBot?.greeting ?? "";
+      const res = await profileRequest("/api/profile", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({action,botId:editingBotId,...botForm,tags})
+      });
+      const bot = res.bot as CommunityBot;
+      if (!bot?.id) throw new Error("The server did not confirm the character publication.");
+
+      if (editingBotId) {
+        setCommunityBots(b => b.map(x => x.id === editingBotId ? bot : x));
+
+        // Keep an already-open character in sync immediately. The greeting is
+        // normally the first persisted message of a conversation, so an editor
+        // change should be visible right away when that message has not itself
+        // been customized. Never overwrite a regenerated/edited first message.
+        if (selected?.id === editingBotId) {
+          setSelected(current => current ? { ...current, ...bot } : current);
+        }
+        if (active && active.characterId === editingBotId && previousGreeting && bot.greeting !== previousGreeting) {
+          const firstMessage = active.messages[0];
+          if (firstMessage?.sender === "character" && firstMessage.text === previousGreeting) {
+            const updatedActive = {
+              ...active,
+              messages: active.messages.map((message, index) => index === 0 ? { ...message, text: bot.greeting } : message),
+              updatedAt: Date.now(),
+            };
+            const nextConversations = conversations.map(c => c.id === active.id ? updatedActive : c);
+            setConversations(nextConversations);
+            await saveAppData(nextConversations, memories, relationships);
+          }
+        }
+      } else {
+        setCommunityBots(b => [bot, ...b]);
+      }
+      const wasEditing = Boolean(editingBotId);
+      setCreateBotOpen(false);
+      setEditingBotId(null);
+      setBotForm({...emptyBotForm});
+      await loadProfile();
+      await loadExplore();
+      setProfileMessage(wasEditing ? "Bot updated successfully." : "Bot published successfully.");
+    } catch(e:any) {
+      setProfileMessage(e?.message || "Unable to publish the bot. Please try again.");
+    } finally {
+      setPublishingBot(false);
+    }
+  }
+
+
+  function startEditBot(bot: CommunityBot) {
+    setEditingBotId(bot.id);
+    setBotForm({
+      name: bot.name, botType: bot.type, description: bot.description, greeting: bot.greeting,
+      personality: bot.personality, scenario: bot.scenario ?? "", speechStyle: bot.speechStyle ?? "",
+      lore: bot.lore ?? "", tags: (bot.tags ?? []).join(", "), image: bot.image ?? "",
+      visibility: bot.visibility === "private" ? "private" : "public", realPersonSafety: bot.type === "real_person",
+      exampleMessages: (bot.exampleMessages ?? []).join("\n"),
+    });
+    setPreviewBotOpen(false);
+    setCreateBotOpen(true);
+  }
+
+  async function deleteBot(bot: CommunityBot) {
+    if (!window.confirm(`Delete "${bot.name}"? This action cannot be undone.`)) return;
+    try {
+      await profileRequest("/api/profile", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"delete-bot",targetId:bot.id})});
+      setCommunityBots(b => b.filter(x => x.id !== bot.id));
+      await loadProfile(); await loadExplore();
+      setProfileMessage("Bot deleted.");
+    } catch(e:any) { setProfileMessage(e.message); }
+  }
+
+  async function deleteAccount() {
+    if (!user || !deleteAccountEmail.trim() || !deleteAccountPassword) {
+      setDeleteAccountError("Confirm your email and password.");
+      return;
+    }
+    setDeleteAccountError("");
+    try {
+      const res = await fetch("/api/auth/delete-account", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: deleteAccountEmail.trim(), password: deleteAccountPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Unable to delete the account.");
+      setDeleteAccountOpen(false);
+      setDeleteAccountEmail("");
+      setDeleteAccountPassword("");
+      await logout();
+      setUser(null);
+      setSelected(null);
+      setActiveConversation(null);
+    } catch (e: any) {
+      setDeleteAccountError(e?.message || "Unable to delete the account.");
+    }
+  }
+
+  async function refreshCurrentChat() {
+    try {
+      const data = await loadAppData();
+      setConversations(data.conversations);
+      setMemories(data.memories);
+      setRelationships(data.relationships);
+      if (activeConversation && !data.conversations.some(c => c.id === activeConversation)) {
+        setActiveConversation(null);
+      }
+      setProfileMessage("Chat updated.");
+    } catch (e: any) {
+      setProfileMessage(e?.message || "Unable to refresh the chat.");
+    }
+  }
+
+  async function shareCharacter() {
+    if (!selected) return;
+    const url = `${window.location.origin}/?character=${encodeURIComponent(selected.id)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setProfileMessage("Character link copied.");
+    } catch {
+      try {
+        const input = document.createElement("input");
+        input.value = url;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("copy failed");
+        setProfileMessage("Character link copied.");
+      } catch {
+        setProfileMessage("Unable to copy the character link.");
+      }
+    }
+  }
+
+  async function openCharacterCreatorProfile() {
+    if (!selected?.creatorId) {
+      setProfileMessage("This character does not have an associated creator profile.");
+      return;
+    }
+    const profile = await loadProfile(selected.creatorId);
+    if (profile) {
+      setConversationPanelOpen(false);
+      setProfileView(true);
+      setProfileTab("created");
+    } else {
+      setProfileMessage("Unable to load the creator profile.");
+    }
+  }
+
+
+  async function createDynamicConversation(character: Character) {
+    // Opening a character can involve an async persistence step. Guard the
+    // transition so a fast double-tap on mobile cannot create two empty chats.
+    if (openingCharacterRef.current === character.id) return;
+    openingCharacterRef.current = character.id;
+    const created = createConversation(character.id, "");
+    const next = [created, ...conversations];
+    // A new roleplay is intentionally isolated: no user memories, relationship
+    // state, emotional state, or previous scene context are carried into it.
+    // Older conversations remain stored so the user can return to them later.
+    const nextRelationships = { ...relationships };
+    delete nextRelationships[created.id];
+    setConversations(next);
+    setRelationships(nextRelationships);
+    setMemories(memories);
+    setActiveConversation(created.id);
+
+    const firstMessage: Message = { id: makeClientId(), sender: "character", text: character.greeting, createdAt: Date.now() };
+    const updated = { ...created, messages: [firstMessage], updatedAt: Date.now() };
+    const saved = next.map(c => c.id === created.id ? updated : c);
+    setConversations(saved);
+    try {
+      await saveAppData(saved, memories, nextRelationships);
+    } finally {
+      if (openingCharacterRef.current === character.id) openingCharacterRef.current = null;
+    }
+  }
+
+  function openCharacter(character: Character) {
+    // Character cards are direct entry points to chat. A tap is an intentional
+    // navigation action in this product; keeping the chat as the immediate
+    // destination also preserves the established PersonaChat interaction model.
+    // The preview remains available from dedicated character-information surfaces.
+    enterCharacterChat(character, false);
+  }
+
+  function enterCharacterChat(character: Character, startNew = false) {
+    setCharacterPreview(null);
+    setProfileView(false);
+    setMobileTab("home");
+    setSelected(character);
+    const existing = conversations.filter(c => c.characterId === character.id).sort((a,b)=>b.updatedAt-a.updatedAt)[0];
+    if (!startNew && existing) setActiveConversation(existing.id);
+    else void createDynamicConversation(character);
+  }
+
+  function newConversation() {
+    if (!selected) return;
+    void createDynamicConversation(selected);
+  }
+
+  async function revealResponse(messageId: string, text: string) {
+    const clean = String(text ?? "").trim();
+    if (!clean) return;
+
+    // The provider currently returns one payload, so the UI owns the presentation
+    // stream. Keep the typing indicator in the same bubble, then reveal the response
+    // progressively without making long replies feel artificially slow.
+    setLiveResponse({ messageId, text: "" });
+    const total = clean.length;
+    const targetDuration = Math.min(4200, Math.max(700, total * 7));
+    const tickMs = 12;
+    const ticks = Math.max(1, Math.ceil(targetDuration / tickMs));
+    const charsPerTick = Math.max(1, Math.ceil(total / ticks));
+
+    for (let index = 0; index < total; index += charsPerTick) {
+      const visible = clean.slice(0, Math.min(total, index + charsPerTick));
+      setLiveResponse({ messageId, text: visible });
+      await new Promise<void>(resolve => window.setTimeout(resolve, tickMs));
+    }
+
+    setLiveResponse({ messageId, text: clean });
+  }
+
+  function getStarterPrompts(character: Character) {
+    if (character.type === "real_person") {
+      return [
+        "What have you been working on lately?",
+        "What are you like when the cameras are off?",
+        "Tell me something people usually get wrong about you."
+      ];
+    }
+    if (character.type === "existing_character") {
+      return [
+        "So... what are we getting into?",
+        "Tell me what's going on here.",
+        "What should I know before we start?"
+      ];
+    }
+    return [
+      "So, tell me about yourself.",
+      "What happens next?",
+      "Let's see where this goes."
+    ];
+  }
+
+  function getLatestResponseFeedback(messages: Message[]) {
+    const latest = [...messages].reverse().find(m => m.sender === "character" && (m.feedback === "like" || m.feedback === "dislike"));
+    if (!latest?.feedback) return undefined;
+    return {
+      value: latest.feedback as "like" | "dislike",
+      tags: latest.feedbackTags ?? [],
+      note: latest.feedbackNote,
+      previousResponse: latest.text,
+    };
+  }
+
+  async function sendMessage() {
+    if (!active || !selected || generatingMessage) return;
+    if (!isAdminUser && usageStatus && usageStatus.used.dailyTokens >= usageStatus.limits.dailyTokens) {
+      setChatError("The daily test limit has ended. Messaging is paused until the limit resets.");
+      return;
+    }
+    setChatError("");
+    const text = message.trim();
+
+    if (!text) {
+      try {
+        generationInFlightRef.current = true;
+        setGeneratingMessage(true);
+        const botId = makeClientId();
+        setLiveResponse({ messageId: botId, text: "" });
+        const result = await generateAIResponse(selected, "", active.messages, memories.filter(m => m.conversationId === active.id), false, "continuation", active.summary, getLatestResponseFeedback(active.messages), active.id, language);
+        if (result.usage) setUsageStatus(result.usage);
+        await revealResponse(botId, result.text);
+        const bot: Message = { id: botId, sender: "character", text: result.text, createdAt: Date.now() };
+        const updated = { ...active, messages: [...active.messages, bot], updatedAt: Date.now() };
+        const next = conversations.map(c => c.id === active.id ? updated : c);
+        const nextRelationships = result.relationship ? { ...relationships, [active.id]: result.relationship } : relationships;
+        setConversations(next); setRelationships(nextRelationships);
+        setLiveResponse(null);
+        setResponseAlternatives(prev => ({ ...prev, [botId]: [{ label: "G1", text: result.text }] }));
+        setSelectedAlternativeIndex(prev => ({ ...prev, [botId]: 0 }));
+        await saveAppData(next, memories, nextRelationships);
+        await fetch("/api/response-alternatives", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: active.id, messageId: botId, alternatives: [{ label: "G1", text: result.text }], selectedLabel: "G1", append: false }) }).catch(() => {});
+      } catch (e: any) {
+        if (e?.usage) setUsageStatus(e.usage as UsageClientState);
+        setChatError(e?.message || "Unable to continue the scene.");
+      } finally {
+        generationInFlightRef.current = false;
+        setGeneratingMessage(false);
+      }
+      return;
+    }
+
+    const baseConversation = active;
+    const userMsg: Message = { id: makeClientId(), sender: "user", text, createdAt: Date.now() };
+    const optimistic = { ...baseConversation, messages: [...baseConversation.messages, userMsg], updatedAt: Date.now() };
+    const nextOptimistic = conversations.map(c => c.id === baseConversation.id ? optimistic : c);
+    setConversations(nextOptimistic);
+    setMessage("");
+
+    try {
+      generationInFlightRef.current = true;
+      setGeneratingMessage(true);
+      // Persist the optimistic user message immediately. This prevents the periodic
+      // cross-device sync from restoring the old conversation while the model is thinking.
+      void saveAppData(nextOptimistic, memories, relationships);
+      const botId = makeClientId();
+      setLiveResponse({ messageId: botId, text: "" });
+      const replyResult = await generateAIResponse(selected, text, active.messages, memories.filter(m => m.conversationId === active.id), false, "chat", active.summary, getLatestResponseFeedback(active.messages), active.id, language);
+      if (replyResult.usage) setUsageStatus(replyResult.usage);
+      await revealResponse(botId, replyResult.text);
+      const bot: Message = { id: botId, sender: "character", text: replyResult.text, createdAt: Date.now() };
+      const updated = { ...optimistic, messages: [...optimistic.messages, bot], title: active.messages.length <= 1 ? text.slice(0, 32) : active.title, updatedAt: Date.now() };
+      const next = conversations.map(c => c.id === active.id ? updated : c);
+      const nextRelationships = replyResult.relationship ? { ...relationships, [active.id]: replyResult.relationship } : relationships;
+      setConversations(next); setRelationships(nextRelationships);
+      setLiveResponse(null);
+      setResponseAlternatives(prev => ({ ...prev, [botId]: [{ label: "G1", text: replyResult.text }] }));
+      setSelectedAlternativeIndex(prev => ({ ...prev, [botId]: 0 }));
+      await saveAppData(next, memories, nextRelationships);

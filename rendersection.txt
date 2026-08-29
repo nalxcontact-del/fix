@@ -1,0 +1,431 @@
+    const nextValue = removing ? undefined : value;
+    const updated={...active,messages:active.messages.map(m=>m.id===messageId?{...m,feedback:nextValue, ...(removing ? {feedbackTags:undefined,feedbackNote:undefined} : {})}:m),updatedAt:Date.now()};
+    const next = conversations.map(c=>c.id===active.id?updated:c);
+    setConversations(next);
+    void saveAppData(next,memories);
+    if (!removing) setFeedbackPromptedIds(ids => ids.includes(messageId) ? ids : [...ids, messageId]);
+    else setFeedbackPromptedIds(ids => ids.filter(id => id !== messageId));
+    if (removing) {
+      await profileRequest("/api/profile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"feedback",targetId:messageId,value})}).catch(()=>{});
+      return;
+    }
+    await profileRequest("/api/profile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"feedback",targetId:messageId,value})}).catch(()=>{});
+    setResponseFeedbackMessageId(messageId);
+    setResponseFeedbackValue(value);
+    setResponseFeedbackTags([]);
+    setResponseFeedbackNote("");
+    setResponseFeedbackStatus("");
+  }
+
+  async function submitResponseFeedback() {
+    if (!responseFeedbackMessageId) return;
+    if (responseFeedbackTags.length === 0) { setResponseFeedbackStatus("Choose at least one characteristic."); return; }
+    if (responseFeedbackTags.includes("other") && responseFeedbackNote.trim().length < 3) { setResponseFeedbackStatus("Briefly explain the other reason."); return; }
+    setResponseFeedbackStatus("Saving...");
+    try {
+      const res = await profileRequest("/api/profile", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ action:"feedback", targetId:responseFeedbackMessageId, value:responseFeedbackValue, tags:responseFeedbackTags, note:responseFeedbackNote.trim() }) });
+      if (!res) throw new Error("Unable to save feedback.");
+      if (active) {
+        const updated={...active,messages:active.messages.map(m=>m.id===responseFeedbackMessageId?{...m,feedback:responseFeedbackValue,feedbackTags:responseFeedbackTags,feedbackNote:responseFeedbackNote.trim()}:m),updatedAt:Date.now()};
+        const next=conversations.map(c=>c.id===active.id?updated:c);
+        setConversations(next);
+        void saveAppData(next,memories);
+      }
+      setResponseFeedbackStatus("Thank you. This helps the character respond better.");
+      window.setTimeout(()=>{setResponseFeedbackOpen(false);setResponseFeedbackStatus("")},700);
+    } catch (e:any) { setResponseFeedbackStatus(e?.message || "Unable to save feedback."); }
+  }
+
+  async function loadResponseAlternatives(conversationId: string, messageId: string) {
+    try {
+      const res = await fetch(`/api/response-alternatives?conversationId=${encodeURIComponent(conversationId)}&messageId=${encodeURIComponent(messageId)}`, { credentials: "include", cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !Array.isArray(data.alternatives)) return;
+      const alternatives = data.alternatives.slice(0, MAX_RESPONSE_GENERATIONS).map((x: any) => ({ label: String(x.label), text: String(x.text) }));
+      if (!alternatives.length) return;
+      setResponseAlternatives(prev => ({ ...prev, [messageId]: alternatives }));
+      const selected = data.alternatives.findIndex((x: any) => x.selected === true);
+      setSelectedAlternativeIndex(prev => ({ ...prev, [messageId]: selected >= 0 ? selected : 0 }));
+    } catch {
+      // Alternatives are an enhancement; the current message remains authoritative.
+    }
+  }
+
+  async function chooseResponseAlternative(messageId: string, index: number) {
+    if (!active || !selected || generatingMessage || regeneratingMessageId) return;
+    const alternatives = responseAlternatives[messageId] ?? [];
+    const candidate = alternatives[index];
+    if (!candidate) return;
+    try {
+      const res = await fetch("/api/response-alternatives", { method: "PATCH", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: active.id, messageId, label: candidate.label }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Unable to select this response.");
+      const updated = { ...active, messages: active.messages.map(m => m.id === messageId ? { ...m, text: candidate.text, feedback: undefined, edited: false } : m), updatedAt: Date.now() };
+      const next = conversations.map(c => c.id === active.id ? updated : c);
+      setConversations(next);
+      setSelectedAlternativeIndex(prev => ({ ...prev, [messageId]: index }));
+      setFeedbackPromptedIds(ids => ids.filter(id => id !== messageId));
+      await saveAppData(next, memories, relationships);
+    } catch (e: any) {
+      setProfileMessage(e?.message || "Unable to select this response.");
+    }
+  }
+
+  async function regenerate(messageId: string) {
+    if (!active || !selected || generatingMessage || regeneratingMessageId || generationInFlightRef.current) return;
+    const index = active.messages.findIndex(m => m.id === messageId);
+    const current = active.messages[index];
+    const existingGenerations = responseAlternatives[messageId] ?? [{ label: "G1", text: current?.text ?? "" }];
+    if (existingGenerations.length >= MAX_RESPONSE_GENERATIONS) return;
+    const lastMessage = active.messages.at(-1);
+    if (index < 0 || current?.sender !== "character" || lastMessage?.id !== messageId) return;
+
+    const isFixedGreeting = index === 0;
+    const previousIndex = active.messages.slice(0, index).map((m, i) => ({ m, i })).reverse().find(({ m }) => m.sender === "user")?.i;
+    const previous = previousIndex === undefined ? undefined : active.messages[previousIndex];
+    if (!isFixedGreeting && !previous) return;
+
+    try {
+      generationInFlightRef.current = true;
+      setRegeneratingMessageId(messageId);
+      setGeneratingMessage(true);
+      setFeedbackPromptedIds(ids => ids.filter(id => id !== messageId));
+      // Keep the existing message slot in place and turn it into the typing state.
+      // This avoids the old response flashing away while the replacement is generated.
+      setLiveResponse({ messageId, text: "" });
+      const historyBeforeLatestUser = previousIndex === undefined ? [] : active.messages.slice(0, previousIndex);
+      const candidateResult = isFixedGreeting
+        ? await generateAIResponse(selected, "", [], memories.filter(m => m.conversationId === active.id), true, "greeting", active.summary, current?.feedback ? { value: current.feedback, tags: current.feedbackTags ?? [], note: current.feedbackNote, previousResponse: current.text } : undefined, active.id, language)
+        : await generateAIResponse(selected, previous!.text, historyBeforeLatestUser, memories.filter(m => m.conversationId === active.id), true, "chat", active.summary, current?.feedback ? { value: current.feedback, tags: current.feedbackTags ?? [], note: current.feedbackNote, previousResponse: current.text } : undefined, active.id, language);
+      if (candidateResult.usage) setUsageStatus(candidateResult.usage);
+      const candidate = candidateResult.text;
+      const generationNumber = existingGenerations.length + 1;
+      const generation = { label: `G${generationNumber}`, text: candidate };
+      const generations = [...existingGenerations, generation].slice(-MAX_RESPONSE_GENERATIONS);
+      const selectedIndex = generations.length - 1;
+      await revealResponse(messageId, candidate);
+      const updated = { ...active, messages: active.messages.map(m => m.id === messageId ? { ...m, text: candidate, feedback: undefined, edited: false } : m), updatedAt: Date.now() };
+      const next = conversations.map(c => c.id === active.id ? updated : c);
+      const nextMemories = memories.filter(m => m.messageId !== messageId);
+      setConversations(next);
+      setMemories(nextMemories);
+      setResponseAlternatives(prev => ({ ...prev, [messageId]: generations }));
+      setSelectedAlternativeIndex(prev => ({ ...prev, [messageId]: selectedIndex }));
+      setFeedbackPromptedIds(ids => ids.filter(id => id !== messageId));
+      if (responseFeedbackMessageId === messageId) {
+        setResponseFeedbackMessageId(null);
+        setResponseFeedbackOpen(false);
+        setResponseFeedbackTags([]);
+        setResponseFeedbackNote("");
+      }
+      setLiveResponse(null);
+      await saveAppData(next, nextMemories, relationships);
+      await fetch("/api/response-alternatives", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: active.id, messageId, alternatives: [generation], selectedLabel: generation.label, append: true }) }).catch(() => {});
+    } catch (e: any) {
+      if (e?.usage) setUsageStatus(e.usage as UsageClientState);
+      setLiveResponse(null);
+      setProfileMessage(e?.message || "Unable to generate another response.");
+    } finally {
+      generationInFlightRef.current = false;
+      setLiveResponse(null);
+      setRegeneratingMessageId(null);
+      setGeneratingMessage(false);
+    }
+  }
+
+  const active = conversations.find(c => c.id === activeConversation) || null;
+
+  useEffect(() => {
+    if (!active || !selected) return;
+    const latestCharacterMessage = [...active.messages].reverse().find(m => m.sender === "character");
+    if (latestCharacterMessage) {
+      if (!responseAlternatives[latestCharacterMessage.id]?.length) {
+        setResponseAlternatives(prev => ({ ...prev, [latestCharacterMessage.id]: [{ label: "G1", text: latestCharacterMessage.text }] }));
+        setSelectedAlternativeIndex(prev => ({ ...prev, [latestCharacterMessage.id]: 0 }));
+      }
+      void loadResponseAlternatives(active.id, latestCharacterMessage.id);
+    }
+  // The latest message id is the relevant cache key; avoid re-fetching on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversation, active?.messages.at(-1)?.id]);
+
+  const dailyLimitReached = !isAdminUser && ((usageStatus?.used.dailyTokens ?? 0) >= (usageStatus?.limits.dailyTokens ?? Number.MAX_SAFE_INTEGER));
+
+  useEffect(() => {
+    if (!selected || !active) return;
+    const frame = requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [selected, active]);
+
+  // Follow the simulated response reveal while the user is still near the bottom.
+  // If they scroll up to reread an earlier message, do not yank the viewport back
+  // down on every reveal tick. This is especially important on mobile, where the
+  // keyboard and small viewport make unexpected scrolling feel much more disruptive.
+  useEffect(() => {
+    if (!selected || !active || !generatingMessage || !liveResponse) return;
+    const end = messagesEndRef.current;
+    const scroller = end?.parentElement;
+    if (!scroller) return;
+    const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    if (distanceFromBottom > 140) return;
+    const frame = requestAnimationFrame(() => {
+      end?.scrollIntoView({ behavior: "auto", block: "end" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [active, generatingMessage, liveResponse, selected]);
+
+  useEffect(() => {
+    const end = messagesEndRef.current;
+    const scroller = end?.parentElement;
+    if (!scroller) {
+      setShowScrollToBottom(false);
+      return;
+    }
+    const update = () => {
+      const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+      setShowScrollToBottom(distanceFromBottom > 220);
+    };
+    update();
+    scroller.addEventListener("scroll", update, { passive: true });
+    return () => scroller.removeEventListener("scroll", update);
+  }, [activeConversation, selected, active?.messages.length]);
+
+  function scrollToLatestMessage() {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    setShowScrollToBottom(false);
+  }
+
+  const exploreCategories = useMemo(() => {
+    const categories = exploreData.categories;
+    if (!categories) return [];
+    return [
+      [t("categoryPopular"), exploreData.popular ?? []],
+      [t("categoryNewest"), exploreData.newest ?? []],
+      [t("categoryRealPeople"), categories.real_person ?? []],
+      [t("categoryExistingCharacters"), categories.existing_character ?? []],
+      [t("categoryOriginalCharacters"), categories.original ?? []],
+      [t("categoryAction"), categories.action ?? []],
+      [t("categoryRomance"), categories.romance ?? []],
+      [t("categoryAnime"), categories.anime ?? []],
+    ].filter(([, bots]) => bots.length) as [string, ExploreBot[]][];
+  }, [exploreData.categories, exploreData.popular, exploreData.newest, t]);
+  if (!authReady) return <div className="auth-loading"><div className="auth-loading-brand">Persona<span>Chat</span></div></div>;
+  if (!user) return <AuthScreen language={language} mode={authMode} setMode={m=>{setAuthMode(m);setAuthError("")}} name={authName} setName={setAuthName} email={authEmail} setEmail={setAuthEmail} password={authPassword} setPassword={setAuthPassword} error={authError} onSubmit={submitAuth} loading={authLoading}/>;
+  if (!capacity) return <div className="capacity-loading">Checking availability...</div>;
+  if (capacity.access === "waiting") return <CapacityQueueScreen state={capacity}/>;
+
+  if (mobileSettingsOpen) return <div className="mobile-settings-page">
+    <header className="mobile-settings-header"><button className="icon-button" onClick={()=>setMobileSettingsOpen(false)} aria-label="Back"><ArrowLeft size={20}/></button><div><strong>{t("settings")}</strong><span>Customize your PersonaChat experience.</span></div></header>
+    <main className="mobile-settings-content">
+      <section className="mobile-settings-group"><h2>{t("appearance")}</h2><div className="mobile-settings-row"><div><strong>{t("theme")}</strong><small>{t("chooseTheme")}</small></div><div className="settings-choice-row">{(["dark","light","system"] as ThemeMode[]).map(v=><button key={v} className={`settings-choice ${theme===v?"selected":""}`} onClick={()=>setTheme(v)}>{t(v)}</button>)}</div></div></section>
+      <section className="mobile-settings-group"><h2>{t("language")}</h2><div className="mobile-settings-row"><div><strong>{t("language")}</strong><small>{t("chooseLanguage")}</small></div><select className="settings-select" value={language} onChange={e=>setLanguage(e.target.value as AppLanguage)}><option value="pt">{t("portuguese")}</option><option value="en">{t("english")}</option><option value="es">{t("spanish")}</option><option value="it">{t("italian")}</option><option value="fr">{t("french")}</option></select></div></section>
+      <section className="mobile-settings-group"><h2>{t("notifications")}</h2><div className="mobile-settings-row"><div><strong>{t("notifications")}</strong><small>{t("notificationsDesc")}</small></div><button className={`toggle ${notifications?"on":""}`} onClick={()=>setNotifications(v=>!v)}><span/></button></div></section>
+      <section className="mobile-settings-group"><h2>{t("account")}</h2><div className="mobile-settings-links"><button onClick={signOut}><LogOut size={16}/> {t("logout")}</button><button className="danger-text" onClick={()=>setDeleteAccountOpen(true)}><Trash2 size={16}/> Delete account</button></div></section>
+      <section className="mobile-settings-group"><h2>{t("privacySupport")}</h2><div className="mobile-settings-links"><a href="/policies#terms" target="_blank" rel="noreferrer"><FileText size={16}/> {t("terms")}</a><a href="/policies#privacy" target="_blank" rel="noreferrer"><ShieldAlert size={16}/> {t("privacy")}</a><button onClick={()=>{setMobileSettingsOpen(false);setFeedbackOpen(true)}}><MessageCircle size={16}/> {t("sendFeedback")}</button></div></section>
+      {isAdminUser&&<section className="mobile-settings-group"><h2>{t("administration")}</h2><div className="mobile-settings-links"><button onClick={()=>{setMobileSettingsOpen(false);void loadAdminReports()}}><Flag size={16}/> {t("openModeration")}</button><button onClick={()=>{setMobileSettingsOpen(false);void loadAdminInsights()}}><BarChart3 size={16}/> {t("productReport")}</button></div></section>}
+    </main>
+    {deleteAccountOpen&&<div className="overlay" onClick={()=>setDeleteAccountOpen(false)}><div className="settings-modal account-delete-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>{t("deleteAccount")}</h2><p>{t("deleteAccountDesc")}</p></div><button onClick={()=>setDeleteAccountOpen(false)}><X/></button></div><label className="form-label"><span>{t("deleteAccountEmail")}</span><input type="email" value={deleteAccountEmail} onChange={e=>setDeleteAccountEmail(e.target.value)} autoComplete="email"/></label><label className="form-label"><span>{t("deleteAccountPassword")}</span><input type="password" value={deleteAccountPassword} onChange={e=>setDeleteAccountPassword(e.target.value)} autoComplete="current-password"/></label>{deleteAccountError&&<p className="form-error">{deleteAccountError}</p>}<button className="auth-submit danger-account-btn" onClick={()=>void deleteAccount()}>{t("deleteAccount")}</button></div></div>}
+  </div>;
+
+  const profileCards = profileData?.id === user.id ? communityBots : (profileData?.bots ?? []);
+  const likedCards = (profileData?.likedBotIds ?? []).map(id => profileData?.likedBots?.find(c=>c.id===id) ?? allCharacters.find(c=>c.id===id)).filter(Boolean) as Character[];
+
+  if (exploreOpen) return <div className="community-page"><header className="community-topbar"><button className="icon-button" onClick={()=>setExploreOpen(false)} aria-label="Back"><ArrowLeft/></button><div className="brand">Persona<span>Chat</span></div><div className="topbar-spacer"/><div className="profile-wrap"><button className="profile" onClick={()=>setProfileOpen(!profileOpen)} aria-label="Open profile"><UserAvatar user={user} size={34}/></button>{profileOpen&&<div className="profile-menu"><strong>{user.name}</strong><span>{user.email}</span><button onClick={()=>openProfile()}>{t("viewProfile")}</button><button onClick={signOut}>{t("logout")}</button></div>}</div></header><main className="explore-page"><section className="explore-hero"><div className="eyebrow">COMMUNITY</div><h1>Explore characters</h1><p>Discover community-created bots and find your next conversation.</p><div className="explore-search"><Search size={19}/><input value={exploreSearch} onChange={async e=>{const value=e.target.value;setExploreSearch(value);if(value.length===0||value.length>=2) await loadExplore(value)}} placeholder="Search bots, creators, or tags..." aria-label="Search bots, creators, or tags"/></div></section>{exploreSearch.trim()?<ExploreSection title="Results" subtitle={`${filteredExplore.length} character(s) found.`} bots={filteredExplore} likedBotIds={likedBotIds} onOpenCharacter={openCharacter} onLikeBot={(id)=>communityAction("like-bot",id)}/>:exploreCategories.length?exploreCategories.map(([category,bots])=><div key={category}><ExploreSection title={category} subtitle="PersonaChat primary category." bots={bots.slice(0,6)} likedBotIds={likedBotIds} onOpenCharacter={openCharacter} onLikeBot={(id)=>communityAction("like-bot",id)}/></div>):<><ExploreSection title="Characters" subtitle="Public bots will appear here as the community starts publishing." bots={exploreData.all.slice(0,6)} likedBotIds={likedBotIds} onOpenCharacter={openCharacter} onLikeBot={(id)=>communityAction("like-bot",id)}/><div className="explore-empty"><Bot size={26}/><p>There are not enough public characters to build categories yet.</p></div></>}</main></div>;
+
+  if (profileView && profileData) return <>
+    {reportOpen&&reportTarget&&<div className="overlay" onClick={()=>setReportOpen(false)}><div className="report-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>Report content</h2><p>{reportTarget.label}</p></div><button onClick={()=>setReportOpen(false)}><X/></button></div><label className="form-label"><span>Reason</span><select value={reportReason} onChange={e=>setReportReason(e.target.value)}><option value="harassment">Harassment or abuse</option><option value="sexual">Inappropriate sexual content</option><option value="violence">Violence</option><option value="hate">Hate or discrimination</option><option value="impersonation">Impersonation</option><option value="spam">Spam</option><option value="privacy">Privacy</option><option value="copyright">Copyright</option><option value="misinformation">Misinformation</option><option value="other">Other</option></select></label><label className="form-label"><span>Details (optional)</span><textarea maxLength={2000} value={reportDetails} onChange={e=>setReportDetails(e.target.value)} placeholder="Briefly explain the issue. Do not include unnecessary personal data."/><small>{reportDetails.length}/2000</small></label>{reportStatus&&<div className="report-status">{reportStatus}</div>}<button className="auth-submit" onClick={submitReport} disabled={reportStatus==="Sending..."}>Submit report</button></div></div>}
+    <div className="community-page">
+    <header className="community-topbar"><button className="icon-button" onClick={()=>setProfileView(false)}><ArrowLeft/></button><div className="brand">Persona<span>Chat</span></div><div className="topbar-spacer"/></header>
+    <main className="profile-page">
+      <section className="profile-hero">
+        <div className="profile-cover"/>
+        <div className="profile-main">
+          <UserAvatar user={profileData} size={104}/>
+          <div className="profile-identity"><h1>{profileData.name}</h1><span>@{profileData.username}</span><p>{t("memberSince")} {new Date(profileData.createdAt).toLocaleDateString(language === "pt" ? "pt-BR" : language === "es" ? "es-ES" : language === "it" ? "it-IT" : language === "fr" ? "fr-FR" : "en-US")}</p></div>
+          <div className="profile-actions">
+            {profileData.id===user.id ? <>
+              <button className="primary-btn" onClick={()=>{setProfileEdit(true);setProfileMessage("")}}>{t("editProfile")}</button>
+              <button className="outline-btn mobile-only-profile-settings" onClick={()=>setMobileSettingsOpen(true)} aria-label="Settings"><Settings size={16}/>Settings</button>
+            </> :
+            <><button className={`outline-btn ${profileData.viewerFollowing?"active":""}`} onClick={()=>communityAction("follow",profileData.id)}><UserPlus size={16}/>{profileData.viewerFollowing?t("following"):t("follow")}</button></>}
+            <button className="outline-btn" onClick={async()=>{try{await navigator.clipboard.writeText(`${window.location.origin}/?profile=${profileData.id}`);setProfileMessage(t("copyProfile"));}catch{setProfileMessage(t("cannotCopy"))}}}><Share2 size={16}/>{t("share")}</button>{profileData.id!==user.id&&<button className="outline-btn danger-outline" onClick={()=>openReport("user",profileData.id,`User @${profileData.username}`)}><Flag size={16}/>{t("report")}</button>}
+          </div>
+        </div>
+        <div className="profile-stats">
+          <button type="button" onClick={()=>setProfileTab("followers")}><strong>{profileData.followers}</strong><span>{t("followers")}</span></button>
+          <button type="button" onClick={()=>setProfileTab("following")}><strong>{profileData.following}</strong><span>{t("followingCount")}</span></button>
+          <button type="button" onClick={()=>setProfileTab("created")}><strong>{profileCards.length}</strong><span>{t("createdBots")}</span></button>
+        </div>
+      </section>
+      {profileMessage && <div className="profile-notice">{profileMessage}</div>}
+      <section className="profile-content">
+        <div className="profile-tabs">
+          <button className={profileTab==="liked"?"active":""} onClick={()=>setProfileTab("liked")}><Heart size={17}/> {t("likedBots")}</button>
+          <button className={profileTab==="created"?"active":""} onClick={()=>setProfileTab("created")}><Bot size={17}/> {t("createdBots")}</button>
+          {profileData.id===user.id&&<button className="create-bot-tab triangular-create" onClick={()=>{setEditingBotId(null);setBotForm({...emptyBotForm});setPreviewBotOpen(false);setCreateBotOrigin("profile");setCreateBotOpen(true)}}><Plus size={17}/> {t("createBot")}</button>}
+        </div>
+        {profileTab==="followers" ? <>{profileData.id!==user.id ? <div className="profile-private-list"><div className="profile-private-icon"><Users size={26}/></div><h3>Private followers</h3><p>This profile&apos;s follower list can only be viewed by the account owner.</p></div> : profileData.followersUsers.length===0 ? <div className="profile-empty"><Users size={34}/><h3>You do not have any followers yet</h3><p>When someone follows you, they will appear here.</p></div> : <div className="following-list">{profileData.followersUsers.map(person=><button className="following-person" key={person.id} onClick={()=>openProfile(person.id)}><UserAvatar user={person} size={50}/><span><strong>{person.name}</strong><small>@{person.username}</small></span><ChevronRight size={17}/></button>)}</div>}</> : profileTab==="following" ? <>{profileData.followingUsers.length===0 ? <div className="profile-empty"><Users size={34}/><h3>{profileData.id===user.id?"You are not following anyone yet":"This user is not following anyone yet"}</h3><p>Profiles you follow will appear here.</p></div> : <div className="following-list">{profileData.followingUsers.map(person=><button className="following-person" key={person.id} onClick={()=>openProfile(person.id)}><UserAvatar user={person} size={50}/><span><strong>{person.name}</strong><small>@{person.username}</small></span><ChevronRight size={17}/></button>)}</div>}</> : (profileTab==="created" ? profileCards : likedCards).length===0 ? <div className="profile-empty"><Bot size={34}/><h3>{profileTab==="created"?t("emptyCreatedTitle"):t("emptyLikedTitle")}</h3><p>{profileTab==="created"?t("emptyCreatedText"):t("emptyLikedText")}</p></div> :
+          <div className="character-grid profile-grid">{(profileTab==="created"?profileCards:likedCards).map(c=><div key={c.id} className="profile-bot-card"><button className="character-card" onClick={()=>openCharacter(toCharacter(c))}><div className="card-image">{c.image?<img src={c.image} alt="" loading="lazy" decoding="async"/>:<div className="bot-placeholder"><Bot size={40}/></div>}</div><div className="card-body"><h3>{c.name}</h3><BotTypeBadge type={c.type}/><p>{c.sceneDescription || c.description}</p><div className="tags">{c.tags.map(t=><span key={t}>{t}</span>)}</div></div></button>{profileData.id===user.id&&profileTab==="created"&&<div className="profile-bot-actions"><button type="button" className="outline-btn" onClick={()=>startEditBot(c)}>Edit</button><button type="button" className="outline-btn danger-outline" onClick={()=>deleteBot(c)}>Delete</button></div>}</div>)}</div>}
+      </section>
+    </main>
+    <nav className="mobile-bottom-nav profile-mobile-bottom-nav" aria-label="Main navigation">
+      <button className="" onClick={()=>{setMobileTab("chats");setProfileView(false)}} aria-label="Seus chats"><MessageCircle size={21}/></button>
+      <button onClick={()=>{setMobileTab("home");setProfileView(false)}} aria-label="Home"><span className="mobile-home-icon">⌂</span></button>
+      <button className="active" onClick={()=>setMobileTab("profile")} aria-label="My profile"><Users size={21}/></button>
+    </nav>
+    {profileEdit&&<div className="overlay" onClick={()=>setProfileEdit(false)}><div className="profile-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>Edit profile</h2><p>Choose how the community sees you.</p></div><button onClick={()=>setProfileEdit(false)}><X/></button></div><div className="avatar-editor"><UserAvatar user={{name:profileName,avatar:profileAvatar}} size={96}/><label className="upload-btn"><Camera size={17}/> {t("changePhoto")}<input type="file" accept="image/*" onChange={e=>chooseAvatar(e.target.files?.[0])}/></label></div><label className="form-label">Name<input value={profileName} onChange={e=>setProfileName(e.target.value)} maxLength={30}/></label><label className="form-label">@User<input value={profileUsername} onChange={e=>setProfileUsername(e.target.value.replace(/^@+/, "").toLowerCase())} maxLength={20} placeholder="user_exemplo"/><p className={`form-help username-status ${usernameAvailable===true?"available":usernameAvailable===false?"taken":""}`}>{usernameAvailable===true?"Available":usernameAvailable===false?"Already in use":"Use letters, numbers, and _."}</p></label><div className="form-label"><span>Gender</span><p className="form-help">This helps characters use feminine or masculine references when needed.</p><div className="gender-options"><button type="button" className={profileGender==="female"?"selected":""} onClick={()=>setProfileGender("female")}>Female</button><button type="button" className={profileGender==="male"?"selected":""} onClick={()=>setProfileGender("male")}>Male</button><button type="button" className={profileGender===""?"selected":""} onClick={()=>setProfileGender("")}>Prefer not to say</button></div></div><button className="auth-submit" onClick={updateProfile}>Save changes</button></div></div>}
+    {characterPreview&&<div className="overlay character-preview-overlay" onClick={()=>setCharacterPreview(null)}>
+      <section className="character-preview-modal" role="dialog" aria-modal="true" aria-labelledby="character-preview-title" onClick={e=>e.stopPropagation()}>
+        <button className="character-preview-close" type="button" onClick={()=>setCharacterPreview(null)} aria-label={t("closeAction")}><X size={20}/></button>
+        <div className="character-preview-cover">
+          {characterPreview.image
+            ? <img src={characterPreview.image} alt={characterPreview.name} />
+            : <div className="bot-placeholder"><Bot size={54}/></div>}
+          <div className="character-preview-gradient" />
+        </div>
+        <div className="character-preview-content">
+          <div className="character-preview-heading">
+            <div>
+              <div className="character-preview-kicker">
+                <BotTypeBadge type={characterPreview.type}/>
+                {characterPreview.type === "real_person" && <span className="character-preview-research-badge"><Sparkles size={12}/> OSINT on PersonaChat+</span>}
+              </div>
+              <h2 id="character-preview-title">{characterPreview.name}</h2>
+              {characterPreview.creator && <p className="character-preview-creator">by {characterPreview.creator}</p>}
+            </div>
+            <button className={`character-preview-like ${likedBotIds.includes(characterPreview.id) ? "liked" : ""}`} type="button" onClick={()=>void communityAction("like-bot", characterPreview.id)} aria-label={likedBotIds.includes(characterPreview.id) ? "Unlike character" : "Like character"}>
+              <Heart size={18} fill={likedBotIds.includes(characterPreview.id) ? "currentColor" : "none"}/>
+            </button>
+          </div>
+
+          <p className="character-preview-description">{characterPreview.sceneDescription || characterPreview.description || "A character ready for a new conversation."}</p>
+
+          {characterPreview.greeting && <div className="character-preview-greeting">
+            <span className="character-preview-label">FIRST MESSAGE</span>
+            <p>“{characterPreview.greeting}”</p>
+          </div>}
+
+          {(characterPreview.tags ?? []).length > 0 && <div className="character-preview-tags">
+            {(characterPreview.tags ?? []).slice(0, 6).map(tag=><span key={tag}>{tag}</span>)}
+          </div>}
+
+          {characterPreview.type === "real_person" && <div className="character-preview-research-note">
+            <Sparkles size={16}/>
+            <div><strong>Current-context research with PersonaChat+</strong><p>Premium can research public, current information when a conversation actually needs it. It never turns private data into a chat fact.</p></div>
+          </div>}
+
+          <div className="character-preview-actions">
+            {conversations.some(c=>c.characterId===characterPreview.id) && <button type="button" className="character-preview-secondary" onClick={()=>enterCharacterChat(characterPreview, false)}>Continue chat</button>}
+            <button type="button" className="character-preview-primary" onClick={()=>enterCharacterChat(characterPreview, !conversations.some(c=>c.characterId===characterPreview.id))}>
+              <MessageCircle size={18}/>{conversations.some(c=>c.characterId===characterPreview.id) ? "Start new chat" : "Start chatting"}
+            </button>
+          </div>
+          <p className="character-preview-hint">You can always start another separate conversation later.</p>
+        </div>
+      </section>
+    </div>}
+    {createBotOpen&&<div className="overlay create-bot-overlay" onClick={()=>{setCreateBotOpen(false);setPreviewBotOpen(false);setCreateBotOrigin(null)}}><div className="profile-modal create-bot-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>{editingBotId ? "Edit bot" : "Create bot"}</h2><p>{editingBotId ? "Update the character sheet and save your changes." : "Build the character sheet before publishing."}</p></div><button onClick={()=>{setCreateBotOpen(false);setPreviewBotOpen(false);setCreateBotOrigin(null)}}><X/></button></div>
+      <label className="form-label form-label-count"><span>Name</span><div className="field-wrap"><input value={botForm.name} maxLength={CHARACTER_LIMITS.name} onChange={e=>setBotForm({...botForm,name:e.target.value})} placeholder="e.g. Captain Orion" /><CharacterCount value={botForm.name} max={CHARACTER_LIMITS.name}/></div></label>
+      <label className="form-label form-label-count"><span>Scene description</span><div className="field-wrap"><input value={botForm.description} maxLength={CHARACTER_LIMITS.description} onChange={e=>setBotForm({...botForm,description:e.target.value})} placeholder="e.g. You meet this character on a rainy night in Gotham." /><CharacterCount value={botForm.description} max={CHARACTER_LIMITS.description}/></div></label>
+      {!editingBotId&&<div className="form-label bot-type-field"><span>Character type</span><p className="form-help">Choose an option. This is saved with the bot and helps determine when public research/OSINT may be used.</p><div className="bot-type-options">
+        <label className={`bot-type-option ${botForm.botType==="real_person"?"selected":""}`}><input type="radio" name="botType" value="real_person" checked={botForm.botType==="real_person"} onChange={()=>setBotForm({...botForm,botType:"real_person"})}/><span className="bot-type-icon">👤</span><strong>Real person</strong><small>Represents someone who exists in real life.</small></label>
+        <label className={`bot-type-option ${botForm.botType==="existing_character"?"selected":""}`}><input type="radio" name="botType" value="existing_character" checked={botForm.botType==="existing_character"} onChange={()=>setBotForm({...botForm,botType:"existing_character"})}/><span className="bot-type-icon">🎭</span><strong>Existing character</strong><small>A character from a known work, franchise, or universe.</small></label>
+        <label className={`bot-type-option ${botForm.botType==="original"?"selected":""}`}><input type="radio" name="botType" value="original" checked={botForm.botType==="original"} onChange={()=>setBotForm({...botForm,botType:"original"})}/><span className="bot-type-icon">✨</span><strong>Original character</strong><small>Created by the user.</small></label>
+      </div></div>}
+      {botForm.botType==="real_person"&&<div className="real-person-safety"><strong>Real-person bot protection</strong><p>Use only appropriate public information. Do not include addresses, phone numbers, documents, real-time location, medical data, passwords, or other private information. The bot must clearly state that it is a simulation and not the real person.</p><label className="safety-check"><input type="checkbox" checked={botForm.realPersonSafety} onChange={e=>setBotForm({...botForm,realPersonSafety:e.target.checked})}/><span>I confirm that I will use only public information and will not present the bot as the real person.</span></label></div>}
+      <label className="form-label form-label-count"><span>Greeting</span><div className="field-wrap"><textarea value={botForm.greeting} maxLength={CHARACTER_LIMITS.greeting} onChange={e=>setBotForm({...botForm,greeting:e.target.value})} placeholder="The first thing the character will say"/><CharacterCount value={botForm.greeting} max={CHARACTER_LIMITS.greeting}/></div></label>
+      <label className="form-label form-label-count"><span>Personality</span><div className="field-wrap"><textarea value={botForm.personality} maxLength={CHARACTER_LIMITS.personality} onChange={e=>setBotForm({...botForm,personality:e.target.value})} placeholder="How this character thinks, reacts, and behaves"/><CharacterCount value={botForm.personality} max={CHARACTER_LIMITS.personality}/></div></label>
+      <label className="form-label form-label-count"><span>Speech style</span><div className="field-wrap"><textarea value={botForm.speechStyle} maxLength={CHARACTER_LIMITS.speechStyle} onChange={e=>setBotForm({...botForm,speechStyle:e.target.value})} placeholder="e.g. sarcastic, concise, uses slang, formal..."/><CharacterCount value={botForm.speechStyle} max={CHARACTER_LIMITS.speechStyle}/></div></label>
+      <label className="form-label form-label-count"><span>Example dialogue</span><div className="field-wrap"><textarea value={botForm.exampleMessages} maxLength={CHARACTER_LIMITS.examplesTotal} onChange={e=>setBotForm({...botForm,exampleMessages:e.target.value})} placeholder="One line per example. Maximum 8 examples, up to 1,200 characters each."/><CharacterCount value={botForm.exampleMessages} max={CHARACTER_LIMITS.examplesTotal}/></div><p className="form-help">Up to {CHARACTER_LIMITS.exampleCount} examples · {CHARACTER_LIMITS.exampleEach} characters per example · {CHARACTER_LIMITS.examplesTotal} total.</p></label>
+      <label className="form-label form-label-count"><span>Scenario</span><div className="field-wrap"><textarea value={botForm.scenario} maxLength={CHARACTER_LIMITS.scenario} onChange={e=>setBotForm({...botForm,scenario:e.target.value})} placeholder="Where the conversation takes place and what the starting situation is"/><CharacterCount value={botForm.scenario} max={CHARACTER_LIMITS.scenario}/></div></label>
+      <label className="form-label form-label-count"><span>Lore / important information</span><div className="field-wrap"><textarea value={botForm.lore} maxLength={CHARACTER_LIMITS.lore} onChange={e=>setBotForm({...botForm,lore:e.target.value})} placeholder="History, relationships, facts, and details the character should know"/><CharacterCount value={botForm.lore} max={CHARACTER_LIMITS.lore}/></div></label>
+      <label className="form-label form-label-count"><span>Tags</span><div className="field-wrap"><input value={botForm.tags} maxLength={CHARACTER_LIMITS.tags} onChange={e=>setBotForm({...botForm,tags:e.target.value})} placeholder="Anime, Adventure, Romance" /><CharacterCount value={botForm.tags} max={CHARACTER_LIMITS.tags}/></div></label>
+      <label className="form-label form-label-count"><span>Image (optional URL)</span><div className="field-wrap"><input value={botForm.image} maxLength={CHARACTER_LIMITS.image} onChange={e=>setBotForm({...botForm,image:e.target.value})} placeholder="https://..." /><CharacterCount value={botForm.image} max={CHARACTER_LIMITS.image}/></div></label>
+      <div className="form-label visibility-field"><span>Visibility</span><div className="visibility-options">
+        <label className={`visibility-option ${botForm.visibility==="public"?"selected":""}`}><input type="radio" name="visibility" checked={botForm.visibility==="public"} onChange={()=>setBotForm({...botForm,visibility:"public"})}/><strong>Public</strong><small>Appears in Explore and can be used by the community.</small></label>
+        <label className={`visibility-option ${botForm.visibility==="private"?"selected":""}`}><input type="radio" name="visibility" checked={botForm.visibility==="private"} onChange={()=>setBotForm({...botForm,visibility:"private"})}/><strong>Private</strong><small>Only visible on your profile.</small></label>
+      </div></div>
+      {profileMessage && <div className="profile-notice create-bot-notice" role="status">{profileMessage}</div>}
+      <div className="create-bot-actions">
+        <button type="button" className="secondary-action" onClick={()=>setPreviewBotOpen(true)} disabled={publishingBot}>Preview bot</button>
+        <button type="button" className="auth-submit" onClick={saveBot} disabled={publishingBot}>{publishingBot ? (editingBotId ? "Saving..." : "Publishing...") : (editingBotId ? "Save changes" : "Publish bot")}</button>
+      </div>
+      </div></div>}
+      {previewBotOpen&&<div className="overlay preview-overlay" onClick={()=>setPreviewBotOpen(false)}><div className="profile-modal bot-preview-modal" onClick={e=>e.stopPropagation()}>
+        <div className="panel-head"><div><h2>Preview</h2><p>This is how the character will appear before you publish it.</p></div><button type="button" onClick={()=>setPreviewBotOpen(false)}><X/></button></div>
+        <div className="bot-preview-card">
+          <div className="bot-preview-cover">{botForm.image ? <img src={botForm.image} alt="" /> : <div className="bot-placeholder"><Bot size={42}/></div>}</div>
+          <div className="bot-preview-body">
+            <div className="bot-preview-title"><h3>{botForm.name.trim() || "Character name"}</h3><span>{botForm.visibility==="public" ? "Public" : "Private"}</span></div>
+            <p className="bot-preview-description">{botForm.description.trim() || "The character description will appear here."}</p>
+            {botForm.tags.trim()&&<div className="tags">{botForm.tags.split(",").map(s=>s.trim()).filter(Boolean).slice(0,8).map(t=><span key={t}>{t}</span>)}</div>}
+            <div className="bot-preview-section"><strong>Personality</strong><p>{botForm.personality.trim() || "No personality defined yet."}</p></div>
+            <div className="bot-preview-section"><strong>Scenario</strong><p>{botForm.scenario.trim() || "No scenario defined yet."}</p></div>
+            <div className="bot-preview-section"><strong>First message</strong><p>{botForm.greeting.trim() || "No greeting defined yet."}</p></div>
+          </div>
+        </div>
+        <div className="create-bot-actions"><button type="button" className="secondary-action" onClick={()=>setPreviewBotOpen(false)}>Back to editing</button><button type="button" className="auth-submit" onClick={()=>{setPreviewBotOpen(false);saveBot();}} disabled={publishingBot}>{editingBotId ? "Save changes" : "Publish bot"}</button></div>
+      </div></div>}
+  </div></>;
+
+  if (selected && active) return <>
+  {reportOpen&&reportTarget&&<div className="overlay" onClick={()=>setReportOpen(false)}><div className="report-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>Report content</h2><p>{reportTarget.label}</p></div><button onClick={()=>setReportOpen(false)}><X/></button></div><label className="form-label"><span>Reason</span><select value={reportReason} onChange={e=>setReportReason(e.target.value)}><option value="harassment">Harassment or abuse</option><option value="sexual">Inappropriate sexual content</option><option value="violence">Violence</option><option value="hate">Hate or discrimination</option><option value="impersonation">Impersonation</option><option value="spam">Spam</option><option value="privacy">Privacy</option><option value="copyright">Copyright</option><option value="misinformation">Misinformation</option><option value="other">Other</option></select></label><label className="form-label"><span>Details (optional)</span><textarea maxLength={2000} value={reportDetails} onChange={e=>setReportDetails(e.target.value)} placeholder="Briefly explain the issue. Do not include unnecessary personal data."/><small>{reportDetails.length}/2000</small></label>{reportStatus&&<div className="report-status">{reportStatus}</div>}<button className="auth-submit" onClick={submitReport} disabled={reportStatus==="Sending..."}>Submit report</button></div></div>}
+  {responseFeedbackOpen&&<div className="overlay response-feedback-overlay" onClick={()=>setResponseFeedbackOpen(false)}><div className="response-feedback-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>{responseFeedbackValue==="like"?"What did you like?":"What did not work?"}</h2><p>Choose the characteristics that best describe this response. This helps guide future responses.</p></div><button onClick={()=>setResponseFeedbackOpen(false)}><X/></button></div><div className="response-feedback-options">{RESPONSE_FEEDBACK_OPTIONS[responseFeedbackValue].map(([key,label])=><button type="button" key={key} className={responseFeedbackTags.includes(key)?"selected":""} onClick={()=>setResponseFeedbackTags(tags=>tags.includes(key)?tags.filter(t=>t!==key):[...tags,key])}>{label}</button>)}</div>{responseFeedbackTags.includes("other")&&<label className="form-label"><span>Tell us more</span><textarea maxLength={600} value={responseFeedbackNote} onChange={e=>setResponseFeedbackNote(e.target.value)} placeholder="Briefly explain why..."/><small>{responseFeedbackNote.length}/600</small></label>}{responseFeedbackStatus&&<div className="report-status">{responseFeedbackStatus}</div>}<div className="feedback-modal-actions"><button className="auth-submit" onClick={submitResponseFeedback} disabled={responseFeedbackStatus==="Saving..."}>Save feedback</button></div></div></div>}
+  {messageMenuId && active && (() => { const target = active.messages.find(m => m.id === messageMenuId); if (!target) return null; const pinned = isMessagePinned(target.id); return <div className="overlay message-menu-overlay" onClick={()=>setMessageMenuId(null)}><div className="message-menu-sheet" onClick={e=>e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t("messageActions")}><div className="message-menu-grab" aria-hidden="true"/><div className="message-menu-list"><button onClick={()=>void copyMessage(target.id)}><Copy size={20}/><span>{t("copyAction")}</span></button><button onClick={()=>prepareMessageAction("branch",target.id)}><Share2 size={20}/><span>{t("newChatFromHere")}</span></button><button onClick={()=>prepareMessageAction("rewind",target.id)}><RotateCcw size={20}/><span>{t("rewindToHere")}</span></button><button onClick={()=>{setEditing(target.id);setEditText(target.text);setMessageMenuId(null)}}><Pencil size={20}/><span>{t("editAction")}</span></button><button onClick={()=>void toggleMessagePin(target.id)}><Pin size={20}/><span>{pinned?t("unpinAction"):t("pinAction")}</span></button><button className="message-menu-danger" onClick={()=>prepareMessageAction("remove",target.id)}><Trash2 size={20}/><span>{t("removeAction")}</span></button></div><button className="message-menu-close" onClick={()=>setMessageMenuId(null)}>{t("closeAction")}</button></div></div> })()}
+  {messageConfirm && active && (() => { const target = active.messages.find(m => m.id === messageConfirm.messageId); if (!target) return null; const copy = messageConfirm.action === "branch" ? {title:t("startNewChatTitle"),text:t("startNewChatText"),action:t("startNewChatAction")} : messageConfirm.action === "rewind" ? {title:t("rewindTitle"),text:t("rewindText"),action:t("rewindAction")} : {title:t("removeTitle"),text:t("removeText"),action:t("removeActionConfirm")}; return <div className="overlay message-confirm-overlay" onClick={()=>setMessageConfirm(null)}><div className="message-confirm-modal" onClick={e=>e.stopPropagation()} role="dialog" aria-modal="true"><div className="panel-head"><div><h2>{copy.title}</h2><p>{copy.text}</p></div><button onClick={()=>setMessageConfirm(null)} aria-label={t("closeAction")}><X/></button></div><div className="message-confirm-actions"><button className="secondary-action" onClick={()=>setMessageConfirm(null)}>{t("cancelAction")}</button><button className={messageConfirm.action==="remove"?"danger-action":"auth-submit"} onClick={()=>void executeMessageAction()}>{copy.action}</button></div></div></div> })()}
+  {feedbackOpen&&<div className="overlay feedback-overlay" onClick={()=>setFeedbackOpen(false)}><div className="feedback-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>{t("sendFeedback")}</h2><p>{t("feedbackDescription")}</p></div><button onClick={()=>setFeedbackOpen(false)}><X/></button></div><label className="form-label"><span>{t("categoryLabel")}</span><select value={feedbackCategory} onChange={e=>setFeedbackCategory(e.target.value)}><option value="feature">Feature suggestion</option><option value="bug">Bug or problem</option><option value="quality">AI quality</option><option value="character">Character behavior</option><option value="interface">Interface</option><option value="other">Other</option></select></label><label className="form-label"><span>{t("feedbackLabel")}</span><textarea maxLength={1500} value={feedbackText} onChange={e=>setFeedbackText(e.target.value)} placeholder={t("feedbackPlaceholder")}/><small>{feedbackText.length}/1500</small></label>{feedbackStatus&&<div className="report-status">{feedbackStatus}</div>}<div className="feedback-modal-actions"><button className="auth-submit" onClick={submitProductFeedback} disabled={feedbackStatus==="Sending..."}>{t("sendFeedback")}</button></div></div></div>}
+  {adminInsightsOpen&&adminInsights&&<div className="overlay" onClick={()=>setAdminInsightsOpen(false)}><div className="admin-modal insights-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>Product report</h2><p>Aggregated data from the last 7 and 30 days.</p></div><button onClick={()=>setAdminInsightsOpen(false)}><X/></button></div><div className="insights-grid"><div className="insight-card"><small>Today · test usage</small><strong>{Number(adminInsights.period?.days1?.tokens||0).toLocaleString("en-US")}</strong><span>tokens · beta ceiling {Number(adminInsights.betaDailyLimit||50000).toLocaleString("en-US")}/tester</span></div><div className="insight-card"><small>Today · generations</small><strong>{Number(adminInsights.period?.days1?.generations||0).toLocaleString("en-US")}</strong><span>current beta traffic</span></div><div className="insight-card"><small>30 days · estimated cost</small><strong>US$ {Number(adminInsights.period?.days30?.cost||0).toFixed(2)}</strong><span>based on configured provider rates</span></div><div className="insight-card"><small>30 days · tokens</small><strong>{Number(adminInsights.period?.days30?.tokens||0).toLocaleString("en-US")}</strong><span>total generation tokens</span></div></div><div className="insight-section"><h3>Beta tester usage today</h3>{(adminInsights.testers||[]).length?(<div className="tester-usage-list">{(adminInsights.testers||[]).map((x:any)=><div className="tester-usage-row" key={x.id}><div><strong>{x.username}</strong><small>{x.email}</small></div><div><strong>{Number(x.dailyTokens||0).toLocaleString("en-US")}</strong><small>{Number(adminInsights.betaDailyLimit||50000).toLocaleString("en-US")} daily limit</small></div></div>)}</div>):<p className="empty">No users yet.</p>}</div><div className="insight-section"><h3>Quality issues</h3>{(adminInsights.topProblems||[]).length?(adminInsights.topProblems.map((x:any)=><div className="insight-row" key={x.type}><span>{x.type}</span><strong>{x.count}</strong></div>)):<p className="empty">No issues recorded.</p>}</div><div className="insight-section"><h3>Explicit feedback</h3>{(adminInsights.recentFeedback||[]).length?(adminInsights.recentFeedback.slice(0,12).map((x:any,i:number)=><div className="feedback-item" key={i}><div><strong>{x.category}</strong><small>{x.username} · {new Date(x.createdAt).toLocaleString("en-US")}</small></div><p>{x.text}</p></div>)):<p className="empty">No feedback submitted yet.</p>}</div><small className="insight-privacy">{adminInsights.privacy}</small></div></div>}
+  {adminOpen&&<div className="overlay" onClick={()=>setAdminOpen(false)}><div className="admin-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><h2>Moderação</h2><p>Denúncias pendentes e histórico recente.</p></div><button onClick={()=>setAdminOpen(false)}><X/></button></div><div className="admin-report-list">{adminReports.length===0?<div className="empty">Nenhuma denúncia encontrada.</div>:adminReports.map((r:any)=><div className="admin-report-card" key={r.id}><div className="admin-report-top"><strong>{r.target_type} · {r.reason}</strong><span className={`report-status-pill ${r.status}`}>{r.status}</span></div><p>{r.details||"Sem detalhes adicionais."}</p>{r.evidence?.text&&<blockquote>{String(r.evidence.text).slice(0,700)}</blockquote>}<small>por @{r.reporter_username||"usuário"} · {new Date(r.created_at).toLocaleString("en-US")}</small><div className="admin-report-actions"><button onClick={()=>updateReport(r.id,"reviewing","normal")}>Em análise</button><button onClick={()=>updateReport(r.id,"resolved","high")}>Resolver</button><button onClick={()=>updateReport(r.id,"dismissed","low")}>Descartar</button></div></div>)}</div></div></div>}
+  {betaWelcomeOpen&&<div className="overlay beta-welcome-overlay" onClick={dismissBetaWelcome}><div className="beta-welcome-modal" role="dialog" aria-modal="true" aria-labelledby="beta-welcome-title" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="beta-pill">BETA</span><h2 id="beta-welcome-title">Welcome to the PersonaChat Beta</h2><p>You are among the first testers. The goal is to chat, explore, and help us find what needs improvement.</p></div><button onClick={dismissBetaWelcome} aria-label={t("closeAction")}><X/></button></div><div className="beta-welcome-list"><div><strong>1.</strong><span>Chat with a character and continue the conversation later.</span></div><div><strong>2.</strong><span>Explore the community and try different characters.</span></div><div><strong>3.</strong><span>Found something strange? Use <b>Send feedback</b>.</span></div></div><button className="auth-submit" onClick={dismissBetaWelcome}>Start exploring</button></div></div>}
+   <PremiumModal open={premiumOpen} onClose={()=>setPremiumOpen(false)} plan={user?.plan}/><div className="app-shell">
+    <aside className="sidebar chat-sidebar">
+      <button className="new-chat" onClick={newConversation}><Plus size={18}/> New conversation</button>
+      <button className="nav-item" onClick={()=>{setSelected(null);setActiveConversation(null)}}><Compass size={18}/> {t("discover")}</button>
+      <div className="side-title"><span>{t("yourChats")}</span></div>
+      <button className="mobile-plus-button chat-sidebar-premium-btn" type="button" onClick={()=>setPremiumOpen(true)} aria-label="Meet PersonaChat+"><span className="mobile-plus-icon"><Sparkles size={16}/></span><span className="mobile-plus-copy"><strong>PersonaChat +</strong><small>More memory and features</small></span><ChevronRight size={16}/></button>
+      <div className="chat-sidebar-search">
+        <Search size={15} aria-hidden="true"/>
+        <input value={chatSearch} onChange={e=>setChatSearch(e.target.value)} placeholder={t("searchYourChats")} aria-label={t("searchYourChats")}/>
+        {chatSearch&&<button type="button" onClick={()=>setChatSearch("")} aria-label="Clear search"><X size={14}/></button>}
+      </div>
+      <div className="chat-sidebar-list">
+        {sidebarConversations.length ? sidebarConversations.map(({ conversation:c, character:ch })=><div key={ch.id} className="conversation-row"><button className={`conversation-item ${selected?.id===ch.id?"active":""}`} onClick={()=>{setSelected(ch);setActiveConversation(c.id)}}><Avatar character={ch} size={36}/><span>{ch.name}</span></button></div>) : <div className="chat-sidebar-empty">{chatSearch.trim()?t("noConversationFound"):"Your conversations will appear here."}</div>}
+      </div>
+    </aside>
+    <main className="chat-main"><header className="chat-header"><button className="icon-button chat-back-button" onClick={()=>{setSelected(null);setActiveConversation(null)}} aria-label="Leave chat"><ArrowLeft size={20}/></button><Avatar character={selected} size={40}/><button className="chat-character-title" onClick={()=>setConversationPanelOpen(true)} title="Open character information"><strong>{selected.name}</strong><span>{selected.description}</span></button><button className="info-button" onClick={()=>setMemoryOpen(true)}><Sparkles size={18}/> Memories</button><button className="icon-button danger" onClick={()=>{if(window.confirm("Delete this conversation?"))deleteConversation(active.id)}} title="Delete conversation"><Trash2 size={18}/></button></header>
+      <section className="messages"><div className="character-intro character-intro-minimal"><strong>{selected.name}</strong> {t("messageCreatedBy")} <button type="button" className="chat-creator-link" onClick={()=>void openCharacterCreatorProfile()}>{selected.creator || "@person"}</button>.</div>
+        {active.messages.map(m=><div key={m.id} className={`message-row ${m.sender}`}><div className="message-content">{m.sender==="character"&&<div className="character-message-author"><Avatar character={selected} size={48}/><strong>{selected.name}</strong></div>}{m.sender==="user"&&<div className="user-message-author"><UserAvatar user={user} size={42}/><strong>{user.name}</strong></div>}{m.sender==="user"&&<div className="message-meta">{m.edited&&"Edited"}</div>}{editing===m.id?<div className="edit-box"><textarea value={editText} onChange={e=>setEditText(e.target.value)}/><button onClick={()=>editMessage(m.id)}>Save</button><button onClick={()=>setEditing(null)}>Cancel</button></div>:<div className="message-action-line"><div className={`bubble ${regeneratingMessageId === m.id ? "bubble-generating" : ""}`}>{regeneratingMessageId === m.id && liveResponse?.messageId === m.id ? (liveResponse.text ? <RichText text={liveResponse.text}/> : <TypingIndicator />) : <RichText text={m.text}/>}</div><button type="button" className="message-more-button" onClick={()=>setMessageMenuId(m.id)} aria-label={`${t("messageActions")} — ${m.sender==="user"?user.name:selected.name}`} title={t("messageActions")}><MoreHorizontal size={17} aria-hidden="true" /></button></div>}
+          {m.sender==="character"&&!editing&&regeneratingMessageId!==m.id&&<div className="bot-actions"><button className="report-message-action" onClick={()=>openReport("message", selected.id, `Message from ${selected.name}`, m.id)} title="Report message" aria-label="Report message"><Flag size={15}/></button><button className={m.feedback==="like"?"selected":""} onClick={()=>feedback(m.id,"like")} title="I liked it" aria-label="I liked this response"><ThumbsUp size={15}/></button><button className={m.feedback==="dislike"?"selected":""} onClick={()=>feedback(m.id,"dislike")} title="I did not like it" aria-label="I did not like this response"><ThumbsDown size={15}/></button>{active.messages.at(-1)?.id===m.id&&(active.messages.findIndex(x=>x.id===m.id)===0||active.messages.slice(0, active.messages.findIndex(x=>x.id===m.id)).some(x=>x.sender==="user"))&&<>{(responseAlternatives[m.id]?.length ?? 0) > 0 && <div className="response-swipe-controls" role="group" aria-label="Response generations"><button type="button" onClick={()=>void chooseResponseAlternative(m.id, Math.max(0, (selectedAlternativeIndex[m.id] ?? 0) - 1))} disabled={generatingMessage||regeneratingMessageId!==null||(selectedAlternativeIndex[m.id] ?? 0)<=0} aria-label="Previous generation"><ChevronLeft size={15}/></button><span>{`${(selectedAlternativeIndex[m.id] ?? 0) + 1}/${MAX_RESPONSE_GENERATIONS}`}</span><button type="button" onClick={()=>{const currentIndex=selectedAlternativeIndex[m.id] ?? 0; const generations=responseAlternatives[m.id] ?? []; if (currentIndex < generations.length - 1) void chooseResponseAlternative(m.id,currentIndex+1); else if (generations.length < MAX_RESPONSE_GENERATIONS) void regenerate(m.id);}} disabled={generatingMessage||regeneratingMessageId!==null||((selectedAlternativeIndex[m.id] ?? 0)>=MAX_RESPONSE_GENERATIONS-1)} aria-label="Next generation"><ChevronRight size={15}/></button></div>}</>}{m.feedback&&feedbackPromptedIds.includes(m.id)&&<button className="response-feedback-more" onClick={()=>{setResponseFeedbackMessageId(m.id);setResponseFeedbackValue(m.feedback!);setResponseFeedbackTags(m.feedbackTags??[]);setResponseFeedbackNote(m.feedbackNote??"");setResponseFeedbackStatus("");setResponseFeedbackOpen(true)}}>Tell us more</button>}</div>}
+          </div></div>)}
+        {generatingMessage&&liveResponse&&!active.messages.some(m => m.id === liveResponse.messageId)&&<div className="message-row character typing-row"><div className="message-content"><div className="character-message-author"><Avatar character={selected} size={48}/><strong>{selected.name}</strong></div><div className="bubble typing-bubble">{liveResponse.text ? <RichText text={liveResponse.text}/> : <TypingIndicator />}</div></div></div>}<div ref={messagesEndRef} aria-hidden="true" />
+      </section>{showScrollToBottom&&<button type="button" className="scroll-to-bottom" onClick={scrollToLatestMessage} aria-label="Jump to latest message" title="Jump to latest message"><ChevronDown size={18}/></button>}
+      <>{selected.type==="real_person"&&<div className="real-person-chat-notice">{t("realBotNotice")}</div>}{dailyLimitReached && <div className="daily-test-limit" role="alert"><strong>{t("dailyLimitTitle")}</strong><span>{t("dailyLimitBody")}</span><small>{dailyLimitCountdown > 0 ? `${t("dailyLimitCountdown")} ${formatCountdown(dailyLimitCountdown)}.` : t("dailyLimitNow")}</small></div>}{chatError&&<div className="chat-error-banner" role="alert"><span>{chatError}</span><div><button type="button" onClick={()=>void sendMessage()} disabled={dailyLimitReached}>{t("tryAgain")}</button><button type="button" onClick={()=>setChatError("")} aria-label={t("closeError")}><X size={15}/></button></div></div>}{active.messages.length===1&&!generatingMessage&&!message.trim()&&<div className="chat-starter-prompts" aria-label="Conversation starters">{getStarterPrompts(selected).map(prompt=><button key={prompt} type="button" onClick={()=>{setMessage(prompt);window.requestAnimationFrame(()=>composerRef.current?.focus())}}>{prompt}</button>)}</div>}<div className="composer-meta composer-feedback-only"><button type="button" onClick={()=>setFeedbackOpen(true)}>{t("sendFeedback")}</button></div><div className="composer" ref={composerShellRef}><textarea ref={composerRef} value={message} onChange={e=>handleComposerChange(e.target.value)} onInput={e=>resizeComposer(e.currentTarget)} onKeyDown={e=>{const touchPrimary=window.matchMedia("(pointer: coarse) and (not (any-pointer: fine))").matches;if(e.key==="Enter"&&!e.shiftKey&&enterSends&&!touchPrimary){e.preventDefault();void sendMessage()}}} placeholder={`${t("chatWith")} ${selected.name}...`} aria-label={`${t("chatWith")} ${selected.name}`} disabled={dailyLimitReached}/><button className="send-button" onClick={()=>void sendMessage()} disabled={generatingMessage || dailyLimitReached} aria-label={message.trim()?t("send"):t("continueScene")} title={message.trim()?t("send"):t("continueScene")}><Send size={19}/></button></div></>
+    </main>
+    {conversationPanelOpen&&<div className="overlay character-panel-overlay" onClick={()=>setConversationPanelOpen(false)}><div className="character-panel" onClick={e=>e.stopPropagation()}>
+      <div className="character-panel-grab" aria-hidden="true"/>
+      <div className="character-panel-head"><button className="panel-close-circle" onClick={()=>setConversationPanelOpen(false)} aria-label={t("closeAction")}><X/></button></div>
+      <div className="character-panel-hero">
+        <img src={selected.image} alt={selected.name} className="character-panel-image"/>
+        <h2>{selected.name}</h2>
+        <p>{selected.description}</p>
+        <div className="character-panel-stats"><span><MessageCircle size={15}/>{selected.likes ?? conversations.filter(c=>c.characterId===selected.id).reduce((n,c)=>n+c.messages.filter(m=>m.sender==="user").length,0).toLocaleString("en-US")}</span><span><Heart size={15} fill={likedBotIds.includes(selected.id)?"currentColor":"none"}/>{likedBotIds.includes(selected.id)?"Liked":"Like"}</span></div>
+        {(selected.tags ?? []).length>0&&<div className="character-panel-tags" aria-label="Tags do character">{(selected.tags ?? []).map(tag=><span key={tag}>{tag}</span>)}</div>}
+        <div className="character-panel-dates"><span>Created {selected.createdAt ? `${Math.max(0, Math.floor((Date.now()-selected.createdAt)/86400000))} days ago` : "on PersonaChat"}</span><span>{selected.updatedAt ? `Updated ${new Date(selected.updatedAt).toLocaleDateString("en-US")}` : ""}</span></div>
+        <div className="character-panel-primary-actions">
+          <button className="character-panel-new-conversation" onClick={()=>{setConversationPanelOpen(false);newConversation()}}><Plus size={17}/> New conversation</button>
+          <button className={`round-action ${likedBotIds.includes(selected.id)?"selected":""}`} onClick={()=>void communityAction("like-bot",selected.id)} title={likedBotIds.includes(selected.id)?"Desfavoritar":"Like"}><Heart size={20} fill={likedBotIds.includes(selected.id)?"currentColor":"none"}/></button>
+          <button className="round-action" onClick={()=>void shareCharacter()} title="Share"><Share2 size={20}/></button>
+        </div>
+      </div>
+      <div className="character-panel-actions-list">
+        <button className="character-panel-action" onClick={()=>void openCharacterCreatorProfile()} disabled={!selected.creatorId}><Users size={20}/><span>Ver perfil do criador</span><ChevronRight size={17}/></button>
+        <button className="character-panel-action" onClick={()=>void refreshCurrentChat()}><RefreshCw size={20}/><span>Atualizar este bate-papo</span><ChevronRight size={17}/></button>
+        <button className="character-panel-action" onClick={()=>{setConversationPanelOpen(false);setMemoryOpen(true)}}><Sparkles size={20}/><span>{t("memoriesChat")}</span><ChevronRight size={17}/></button>
+        <button className="character-panel-action danger-text" onClick={()=>openReport("bot",selected.id,`Character ${selected.name}`)}><Flag size={20}/><span>Report character</span><ChevronRight size={17}/></button>
+      </div>
+      <div className="character-panel-conversations">
+        <div className="character-panel-section-title"><strong>{t("conversations")}</strong></div>
+        {conversations.filter(c=>c.characterId===selected.id).sort((a,b)=>b.updatedAt-a.updatedAt).map(c=><div className="conversation-manage-row" key={c.id}>{renamingConversation===c.id?<div className="conversation-rename full"><input autoFocus value={renameText} onChange={e=>setRenameText(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")renameConversation(c.id);if(e.key==="Escape"){setRenamingConversation(null);setRenameText("")}}}/><button onClick={()=>renameConversation(c.id)}><Check size={16}/></button></div>:<><button className="conversation-manage-main" onClick={()=>{setActiveConversation(c.id);setConversationPanelOpen(false)}}><MessageCircle size={17}/><span><strong>{c.title}</strong><small>{new Date(c.updatedAt).toLocaleString("en-US")}</small></span></button><div className="conversation-manage-actions"><button onClick={()=>{setRenamingConversation(c.id);setRenameText(c.title)}} title="Renomear"><RefreshCw size={15}/></button><button className="danger" onClick={()=>{if(window.confirm("Delete this conversation?"))deleteConversation(c.id)}} title="Apagar"><Trash2 size={15}/></button></div></>}</div>)}
+        {!conversations.some(c=>c.characterId===selected.id)&&<div className="empty">{t("noConversations")}</div>}
