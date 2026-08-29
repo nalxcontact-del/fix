@@ -1,0 +1,23 @@
+import fs from "node:fs";
+import path from "node:path";
+const root=process.cwd();
+const read=f=>fs.readFileSync(path.join(root,f),"utf8");
+const checks=[];
+const check=(n,p)=>checks.push([n,!!p]);
+const chat=read("app/api/chat/route.ts");
+const page=read("app/page.tsx");
+const usage=read("lib/server/usage.ts");
+const gemini=read("lib/server/gemini.ts");
+const env=read(".env.example");
+check("Gemini is the only active chat provider", chat.includes('const primaryProvider = "gemini"') && chat.includes("requestGemini") && !chat.includes("requestGroq"));
+check("client selects Gemini explicitly", page.includes('provider: "gemini"') && !page.includes("requestGroq") && !page.includes("Groq"));
+check("provider usage is recorded", chat.includes('provider: "gemini"') && chat.includes("recordGeneration"));
+check("usage budget is provider-specific", usage.includes("user_id = ? AND provider = ?") && usage.includes("provider = ? AND created_at"));
+check("generation budget is checked before request", chat.includes('checkGenerationBudget(db, user.id, userPlan, estimatedPromptTokens + maxGenerationTokens(), "gemini", authenticatedUser.isAdmin === true)'));
+check("transient Gemini errors are retried", gemini.includes("[429, 503]") || gemini.includes("429") && gemini.includes("503"));
+check("quality retry stays on Gemini", chat.includes('requestProvider(retryInstruction, history, userMessage, 0.76') && chat.includes("extractGeminiText"));
+check("Gemini key is server-side env", env.includes("GEMINI_API_KEY=") && !page.includes("GEMINI_API_KEY"));
+check("friendly Gemini error exists", chat.includes("temporarily unavailable or overloaded"));
+let ok=0; for(const [n,p] of checks){console.log(`${p?"OK":"FAIL"} — ${n}`);if(p)ok++;}
+console.log(`Phase 46 Gemini-only checks: ${ok}/${checks.length} OK`);
+if(ok!==checks.length)process.exit(1);

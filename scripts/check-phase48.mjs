@@ -1,0 +1,20 @@
+import fs from "node:fs";
+const read = (p) => fs.readFileSync(p, "utf8");
+const chat = read("app/api/chat/route.ts");
+const quality = read("lib/server/quality.ts");
+const learning = read("lib/server/response-learning.ts");
+const usage = read("lib/server/usage.ts");
+const db = read("lib/server/db.ts");
+const page = read("app/page.tsx");
+let failed = 0;
+function check(name, ok) { console.log(`${ok ? "PASS" : "FAIL"} ${name}`); if (!ok) failed++; }
+check("double-quote formatting guard", quality.includes("unclosed_quote") && quality.includes("repairResponseFormatting"));
+check("manual regeneration has multi-candidate optimizer", chat.includes("style: \"faithful\"") && chat.includes("style: \"emotional\"") && chat.includes("style: \"dynamic\"") && chat.includes("responseCandidateScore"));
+check("regeneration uses feedback without copying rejected text", chat.includes("REGENERATION DIRECTION") && chat.includes("Do not mention, quote, imitate, paraphrase, or rely on the rejected response"));
+check("learned response preferences enter character prompt", chat.includes("getResponsePreferenceContext") && chat.includes("responsePreferenceContext"));
+check("feedback profile is persisted separately from roleplay memory", db.includes("response_preference_profiles"));
+check("feedback rebuild is wired", learning.includes("rebuildResponsePreferenceProfile") && read("app/api/profile/route.ts").includes("rebuildResponsePreferenceProfile"));
+check("free regeneration default is 12/day", usage.includes("PERSONACHAT_FREE_REGENERATIONS_PER_DAY",) && usage.includes("envInt(\"PERSONACHAT_FREE_REGENERATIONS_PER_DAY\", 12)"));
+check("frontend sends rejected response to regeneration", page.includes("previousResponse: current.text"));
+check("roleplay memory remains conversation-scoped", chat.includes("m.conversationId === scopedConversationId") && chat.includes("conversation_relationships"));
+process.exit(failed ? 1 : 0);

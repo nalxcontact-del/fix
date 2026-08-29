@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#181818"/><stop offset="1" stop-color="#4a1f2b"/></linearGradient></defs>
+  <rect width="600" height="800" fill="url(#g)"/>
+  <circle cx="300" cy="285" r="125" fill="#d1a184"/>
+  <path d="M174 280c12-123 82-175 154-151 58 19 94 71 98 151-39-44-72-63-125-66-48 3-84 22-127 66z" fill="#242424"/>
+  <path d="M195 430c32-47 178-47 210 0l48 285H147z" fill="#202020"/>
+  <path d="M205 240c26-22 55-33 95-33 40 0 71 11 95 33" fill="none" stroke="#171717" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="255" cy="286" r="9"/><circle cx="345" cy="286" r="9"/>
+  <text x="300" y="750" fill="#fff" font-family="Arial, sans-serif" font-size="34" text-anchor="middle" letter-spacing="7">REVY</text>
+  <text x="300" y="780" fill="#ddd" font-family="Arial, sans-serif" font-size="15" text-anchor="middle" letter-spacing="3">BLACK LAGOON</text>
+</svg>
